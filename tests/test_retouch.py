@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 
 import numpy as np
@@ -246,9 +247,20 @@ def test_rect_too_large_rejected(client, ids):
 
 def test_bad_lab_ranges_rejected(client, ids):
     job = _run_job(client, ids)
-    for bad in ([101, 0, 0], [50, 128, 0], [50, 0, -129], [float("nan"), 0, 0]):
+    for bad in ([101, 0, 0], [50, 128, 0], [50, 0, -129]):
         r = _retouch(client, job["job_id"], target_lab=bad)
         assert r.status_code == 422, bad
+    # 新版 httpx 拒绝在客户端编码 NaN；显式发送 JSON 裸 NaN token，
+    # 验证服务端 validate_request 仍然拒绝。
+    r = client.post(
+        "/api/retouch",
+        content='{"job_id": %s, "x": 4, "y": 4, "width": 16, "height": 16, '
+                '"target_lab": [NaN, 0, 0], "tolerance_de": 3.0, '
+                '"max_shift": 8, "tac_limit": 1020}'
+                % json.dumps(job["job_id"]),
+        headers={"Content-Type": "application/json"},
+    )
+    assert r.status_code == 422, r.text
 
 
 def test_bad_constraints_rejected(client, ids):
@@ -338,3 +350,223 @@ def test_proof_pngs_are_tagged_with_display_profile(client, ids):
     for url in (d["images"]["before"], d["images"]["after"]):
         im = Image.open(io.BytesIO(client.get(url).content))
         assert im.info.get("icc_profile") == display
+
+
+# --------------------------------------------------------------------------
+# 身份规则：不同请求必须区分（含无分隔拼接触发的 (1,23,4,5)/(12,3,4,5)
+# 串用回归），相同请求稳定复用；浮点不被六位小数格式化错误合并。
+# --------------------------------------------------------------------------
+
+def _gradient_png(size=48):
+    """非平坦图：不同位置选区颜色不同，搜索结果应不同。"""
+    xs = np.linspace(40, 220, size, dtype=np.uint8)[None, :]
+    ys = np.linspace(60, 200, size, dtype=np.uint8)[:, None]
+    arr = np.zeros((size, size, 3), np.uint8)
+    arr[..., 0] = xs
+    arr[..., 1] = ys
+    arr[..., 2] = 120
+    buf = io.BytesIO()
+    Image.fromarray(arr, "RGB").save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _run_gradient_job(client, ids):
+    r = client.post(
+        "/api/jobs",
+        files={"image": ("gradient.png", _gradient_png(), "image/png")},
+        data={
+            "source_profile": ids["srgb"],
+            "press_profile": ids["cmyk"],
+            "display_profile": ids["display"],
+            "threshold": "3",
+        },
+    )
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def test_distinct_rects_get_distinct_search_report_and_artifacts(client, ids):
+    """(1,23,4,5) 与 (12,3,4,5) 旧规则下无分隔拼接都形成 12345，必须分开。"""
+    job = _run_gradient_job(client, ids)
+    common = dict(
+        target_lab=[45.0, 5.0, -15.0],
+        tolerance_de=3.0, max_shift=8, tac_limit=1020,
+    )
+    r1 = _retouch(client, job["job_id"], x=1, y=23, width=4, height=5, **common)
+    r2 = _retouch(client, job["job_id"], x=12, y=3, width=4, height=5, **common)
+    d1, d2 = r1.json(), r2.json()
+    assert r1.status_code == 200 and r2.status_code == 200
+    assert d1["retouch_id"] != d2["retouch_id"]
+    assert d1["rect"] != d2["rect"]
+    assert d1["rect"] == {"x": 1, "y": 23, "width": 4, "height": 5}
+    assert d2["rect"] == {"x": 12, "y": 3, "width": 4, "height": 5}
+
+    from app import main
+    b1 = main.RETOUCH_DIR / d1["retouch_id"]
+    b2 = main.RETOUCH_DIR / d2["retouch_id"]
+    assert b1.is_dir() and b2.is_dir() and b1 != b2
+    assert (b1 / "report.json").read_bytes() != (b2 / "report.json").read_bytes()
+    assert (b1 / "before.png").read_bytes() != (b2 / "before.png").read_bytes()
+    assert (b1 / "after.png").read_bytes() != (b2 / "after.png").read_bytes()
+
+    # 第二次提交不得拿到第一次的选区/预览。
+    again2 = _retouch(client, job["job_id"], x=12, y=3, width=4, height=5,
+                      **common).json()
+    assert again2["retouch_id"] == d2["retouch_id"]
+    assert again2["rect"] == d2["rect"]
+    assert client.get(again2["images"]["before"]).content == \
+        (b2 / "before.png").read_bytes()
+    assert client.get(again2["images"]["before"]).content != \
+        (b1 / "before.png").read_bytes()
+
+    # 两个报告各自绑定自己的矩形与原任务。
+    for rid, rect in ((d1["retouch_id"], d1["rect"]),
+                      (d2["retouch_id"], d2["rect"])):
+        rep = client.get(f"/api/retouch/{rid}/report").json()
+        assert rep["region"] == rect
+        assert rep["source_job"]["job_id"] == job["job_id"]
+
+    # 成品（可达时）也各自绑定：ROI 外字节等于原任务、ROI 内偏移与报告一致。
+    for d in (d1, d2):
+        if d["tiff"]:
+            tif = np.asarray(Image.open(io.BytesIO(client.get(d["tiff"]).content)))
+            orig = np.load(main.JOB_DIR / job["job_id"] / "cmyk.npy")
+            rect = d["rect"]
+            x, y, w, h = rect["x"], rect["y"], rect["width"], rect["height"]
+            off = np.array(d["best_offset_cmyk"], dtype=np.int32)
+            diff = tif[y:y + h, x:x + w].astype(np.int32) - \
+                orig[y:y + h, x:x + w].astype(np.int32)
+            assert np.all(diff == off[None, :])
+            mask = np.zeros(orig.shape[:2], dtype=bool)
+            mask[y:y + h, x:x + w] = True
+            assert np.array_equal(tif[~mask], orig[~mask])
+
+
+def test_identical_request_reuses_identical_result(client, ids):
+    job = _run_gradient_job(client, ids)
+    d1 = _retouch(client, job["job_id"], x=7, y=9, width=10, height=8,
+                  target_lab=[52.25, -3.5, 7.125], tolerance_de=1.25,
+                  max_shift=6, tac_limit=900).json()
+    d2 = _retouch(client, job["job_id"], x=7, y=9, width=10, height=8,
+                  target_lab=[52.25, -3.5, 7.125], tolerance_de=1.25,
+                  max_shift=6, tac_limit=900).json()
+    assert d1["retouch_id"] == d2["retouch_id"]
+    assert d1["best_offset_cmyk"] == d2["best_offset_cmyk"]
+    assert d1["rect"] == d2["rect"]
+    # int 50 与 float 50.0 语义相同，应视为同一请求。
+    d3 = _retouch(client, job["job_id"], x=7, y=9, width=10, height=8,
+                  target_lab=[50, -3.5, 7.125], tolerance_de=1.25,
+                  max_shift=6, tac_limit=900).json()
+    d4 = _retouch(client, job["job_id"], x=7, y=9, width=10, height=8,
+                  target_lab=[50.0, -3.5, 7.125], tolerance_de=1.25,
+                  max_shift=6, tac_limit=900).json()
+    assert d3["retouch_id"] == d4["retouch_id"]
+
+
+def test_target_lab_and_tolerance_sub_microdifferences_stay_distinct(client, ids):
+    """第 7 位小数不同的目标/容差不得被六位小数格式化合并。"""
+    from app.retouch import compute_retouch_id, validate_request
+    job = _run_gradient_job(client, ids)
+    from app import main as _main
+    meta = json.loads(
+        (_main.JOB_DIR / job["job_id"] / "meta.json").read_text("utf-8")
+    )
+
+    def req(**over):
+        body = {
+            "job_id": job["job_id"], "x": 4, "y": 4, "width": 16, "height": 16,
+            "target_lab": [50.0, 10.0, -10.0],
+            "tolerance_de": 3.0, "max_shift": 8, "tac_limit": 1020,
+        }
+        body.update(over)
+        return validate_request(body)
+
+    id_a = compute_retouch_id(meta, req(target_lab=[50.0, 10.0, -10.0]))
+    id_b = compute_retouch_id(meta, req(target_lab=[50.0000001, 10.0, -10.0]))
+    id_c = compute_retouch_id(meta, req(tolerance_de=3.0))
+    id_d = compute_retouch_id(meta, req(tolerance_de=3.0000001))
+    assert id_a != id_b
+    assert id_c != id_d
+    # 同一请求重复计算身份稳定。
+    assert id_a == compute_retouch_id(meta, req())
+
+
+def test_retouch_id_collision_regression_unit():
+    from app.retouch import RetouchRequest, compute_retouch_id
+    meta = {"job_id": "j", "source_intent": "relative_colorimetric",
+            "proof_intent": "relative_colorimetric"}
+
+    def rq(x, y, w, h):
+        return RetouchRequest(
+            job_id="j", x=x, y=y, width=w, height=h,
+            target_lab=(50.0, 10.0, -10.0), tolerance_de=3.0,
+            max_shift=8, tac_limit=1020)
+
+    assert compute_retouch_id(meta, rq(1, 23, 4, 5)) != \
+        compute_retouch_id(meta, rq(12, 3, 4, 5))
+    # 其它无分隔拼接歧义也必须分开。
+    assert compute_retouch_id(meta, rq(1, 2, 34, 5)) != \
+        compute_retouch_id(meta, rq(12, 3, 4, 5))
+    # 相同请求身份一致；不同意图/任务身份不同。
+    assert compute_retouch_id(meta, rq(1, 2, 3, 4)) == \
+        compute_retouch_id(meta, rq(1, 2, 3, 4))
+    meta2 = dict(meta, job_id="k")
+    assert compute_retouch_id(meta, rq(1, 2, 3, 4)) != \
+        compute_retouch_id(meta2, rq(1, 2, 3, 4))
+    meta3 = dict(meta, source_intent="perceptual")
+    assert compute_retouch_id(meta, rq(1, 2, 3, 4)) != \
+        compute_retouch_id(meta3, rq(1, 2, 3, 4))
+
+
+def test_tampered_cache_is_rejected_and_recomputed(client, ids):
+    """缓存报告/产物与请求绑定不符（被串改、缺文件）时拒绝复用并重算。"""
+    from app import main
+    job = _run_gradient_job(client, ids)
+    d = _retouch(client, job["job_id"], x=4, y=4, width=12, height=12,
+                 target_lab=[50.0, 10.0, -10.0], tolerance_de=2.0,
+                 max_shift=8, tac_limit=1020).json()
+    base = main.RETOUCH_DIR / d["retouch_id"]
+
+    # 1) 篡改报告中的矩形：同 ID 目录再提交时必须识别并重算/拒绝复用，
+    #    返回结果仍严格绑定本次请求。
+    rep_path = base / "report.json"
+    rep = json.loads(rep_path.read_text("utf-8"))
+    rep["region"]["x"] = 99
+    rep_path.write_text(json.dumps(rep), "utf-8")
+    again = _retouch(client, job["job_id"], x=4, y=4, width=12, height=12,
+                     target_lab=[50.0, 10.0, -10.0], tolerance_de=2.0,
+                     max_shift=8, tac_limit=1020)
+    assert again.status_code == 200
+    assert again.json()["rect"]["x"] == 4
+    assert json.loads(rep_path.read_text("utf-8"))["region"]["x"] == 4
+
+    # 2) 删除预览 PNG：拒绝复用并重新生成。
+    (base / "after.png").unlink()
+    again2 = _retouch(client, job["job_id"], x=4, y=4, width=12, height=12,
+                      target_lab=[50.0, 10.0, -10.0], tolerance_de=2.0,
+                      max_shift=8, tac_limit=1020)
+    assert again2.status_code == 200
+    assert (base / "after.png").exists()
+
+    # 3) 替换预览 PNG 字节（与报告摘要不符）：重新计算恢复；GET 期间若
+    #    直接命中被替换文件则返回 422。
+    (base / "before.png").write_bytes(b"not-a-png")
+    assert client.get(d["images"]["before"]).status_code == 422
+    again3 = _retouch(client, job["job_id"], x=4, y=4, width=12, height=12,
+                      target_lab=[50.0, 10.0, -10.0], tolerance_de=2.0,
+                      max_shift=8, tac_limit=1020)
+    assert again3.status_code == 200
+    assert client.get(d["images"]["before"]).status_code == 200
+
+    # 4) 把另一个矩形的报告硬塞进同一目录（模拟旧版串用脏数据落盘）：
+    #    按本次请求校验失败，重算后报告 region 必须是本次矩形。
+    other = _retouch(client, job["job_id"], x=20, y=20, width=8, height=8,
+                     target_lab=[50.0, 10.0, -10.0], tolerance_de=2.0,
+                     max_shift=8, tac_limit=1020).json()
+    other_rep = (main.RETOUCH_DIR / other["retouch_id"] / "report.json").read_bytes()
+    rep_path.write_bytes(other_rep)
+    again4 = _retouch(client, job["job_id"], x=4, y=4, width=12, height=12,
+                      target_lab=[50.0, 10.0, -10.0], tolerance_de=2.0,
+                      max_shift=8, tac_limit=1020)
+    assert again4.status_code == 200
+    assert again4.json()["rect"] == d["rect"]

@@ -24,11 +24,12 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 
 from . import colorscience, lcms_native
 
@@ -382,22 +383,56 @@ def export_retouched_tiff(cmyk_adjusted: np.ndarray, press_bytes: bytes) -> byte
 
 
 def compute_retouch_id(meta: dict, req: RetouchRequest) -> str:
+    """请求身份：原任务 + 完整请求参数的 SHA-256。
+
+    身份必须既能**区分任何不同的请求**，又能让**相同请求稳定复用**。
+    旧实现把 ``x/y/width/height`` 无分隔地 ``str()`` 拼接（``(1,23,4,5)``
+    与 ``(12,3,4,5)`` 都形成 ``"12345"``），且把目标 Lab、容差格式化为
+    六位小数（第 7 位起不同的请求被错误合并），导致结果串用。现在改为对
+    每个字段做**带长度前缀的自界定（self-delimiting）规范编码**，浮点按
+    Python ``repr``（最短往返 repr，等价于 ``json.dumps`` 对 float 的
+    输出，能区分 1e-7 量级差异）；校验阶段已拒绝 NaN/Infinity，-0.0 先
+    归一为 0.0。字段顺序固定，字段间以类型+长度界定，因此任何字段拼接
+    都不可能跨字段歧义。
+    """
+    def num(v: float) -> str:
+        v = float(v)
+        return "0" if v == 0.0 else repr(v)
+
+    fields: list[tuple[str, str]] = [
+        ("schema", "retouch-identity/v2"),
+        ("job_id", str(meta["job_id"])),
+        ("source_intent", str(meta.get("source_intent") or "")),
+        ("proof_intent", str(meta.get("proof_intent") or "")),
+        ("x", str(int(req.x))),
+        ("y", str(int(req.y))),
+        ("width", str(int(req.width))),
+        ("height", str(int(req.height))),
+        ("target_l", num(req.target_lab[0])),
+        ("target_a", num(req.target_lab[1])),
+        ("target_b", num(req.target_lab[2])),
+        ("tolerance_de", num(req.tolerance_de)),
+        ("max_shift", str(int(req.max_shift))),
+        ("tac_limit", str(int(req.tac_limit))),
+    ]
     h = hashlib.sha256()
-    h.update(meta["job_id"].encode())
-    h.update(meta.get("source_intent", "").encode())
-    h.update(meta.get("proof_intent", "").encode())
-    for key in ("x", "y", "width", "height"):
-        h.update(str(getattr(req, key)).encode())
-    h.update(",".join(f"{v:.6f}" for v in req.target_lab).encode())
-    h.update(f"{req.tolerance_de:.6f}".encode())
-    h.update(str(req.max_shift).encode())
-    h.update(str(req.tac_limit).encode())
+    for key, value in fields:
+        chunk = f"{key}:{value}".encode("utf-8")
+        h.update(str(len(chunk)).encode("ascii"))
+        h.update(b":")
+        h.update(chunk)
+        h.update(b";")
     return h.hexdigest()
 
 
 def build_report(retouch_id: str, meta: dict, press_summary: dict,
-                 display_summary: dict, req: RetouchRequest, result: dict) -> dict:
-    """修色报告：记录原任务、ICC 摘要、全部约束与最终偏移。"""
+                 display_summary: dict, req: RetouchRequest, result: dict,
+                 artifact_sha256: dict[str, str] | None = None) -> dict:
+    """修色报告：记录原任务、ICC 摘要、全部约束与最终偏移。
+
+    ``artifact_sha256`` 记录实际落盘产物（before.png/after.png，以及可达时
+    的 retouched.tif）的 SHA-256，作为缓存复用时“报告与产物绑定”的凭据。
+    """
     return {
         "retouch_id": retouch_id,
         "source_job": {
@@ -436,9 +471,296 @@ def build_report(retouch_id: str, meta: dict, press_summary: dict,
             if result["reachable"]
             else {"tiff": None, "before_png": "before.png", "after_png": "after.png"}
         ),
+        "artifact_sha256": dict(artifact_sha256 or {}),
         "note": (
             "修色以原任务分色 CMYK 为起点，按原印刷 ICC 搜索统一整数偏移；"
             "仅当最优平均 Lab ΔE00 不超过容差时标记可达并导出嵌入印刷 ICC 的 "
             "CMYK TIFF（选区外字节不变）。不可达时不生成成品。"
         ),
     }
+
+
+# ---------------------------------------------------------------------------
+# 缓存复用：命中磁盘结果前必须重新核对“任务 + 矩形 + 约束 + ICC + 产物”绑定
+# ---------------------------------------------------------------------------
+
+def _is_num(v) -> bool:
+    return (not isinstance(v, bool) and isinstance(v, (int, float))
+            and float(v) == float(v)  # 拒绝 NaN
+            and abs(float(v)) != float("inf"))
+
+
+def _num_close(rep, actual: float) -> bool:
+    """报告 constraints 块逐位保存原始目标 Lab/容差，必须与本次请求一致。"""
+    return _is_num(rep) and abs(float(rep) - float(actual)) <= 1e-9
+
+
+def _check_report_binding(report: object, retouch_id: str, meta: dict,
+                          req: RetouchRequest, ctx: dict,
+                          press_summary: dict, display_summary: dict) -> bool:
+    """仅做内存中的字段绑定核对（不读磁盘文件）。"""
+    if not isinstance(report, dict):
+        return False
+    if report.get("retouch_id") != retouch_id:
+        return False
+
+    job = report.get("source_job")
+    if not isinstance(job, dict):
+        return False
+    if job.get("job_id") != meta["job_id"]:
+        return False
+    if job.get("image_sha256") != meta.get("image_sha256"):
+        return False
+    if job.get("width") != meta.get("width") or job.get("height") != meta.get("height"):
+        return False
+    if job.get("source_intent") != meta.get("source_intent"):
+        return False
+    if job.get("proof_intent") != meta.get("proof_intent"):
+        return False
+
+    profiles = report.get("profiles")
+    if not isinstance(profiles, dict):
+        return False
+    press_rep, display_rep = profiles.get("press"), profiles.get("display")
+    if not isinstance(press_rep, dict) or not isinstance(display_rep, dict):
+        return False
+    if press_rep.get("sha256") != press_summary["sha256"]:
+        return False
+    if press_rep.get("color_space") != "CMYK":
+        return False
+    if display_rep.get("sha256") != display_summary["sha256"]:
+        return False
+    if display_rep.get("color_space") != "RGB":
+        return False
+
+    cmyk_full = ctx["cmyk"]
+    H, W = cmyk_full.shape[:2]
+    if req.x >= W or req.y >= H:
+        return False
+    x2 = min(W, req.x + req.width)
+    y2 = min(H, req.y + req.height)
+    rw, rh = x2 - req.x, y2 - req.y
+
+    region = report.get("region")
+    if not isinstance(region, dict):
+        return False
+    if region != {"x": int(req.x), "y": int(req.y),
+                  "width": int(rw), "height": int(rh)}:
+        return False
+    if report.get("pixel_count") != int(rw * rh):
+        return False
+
+    constraints = report.get("constraints")
+    if not isinstance(constraints, dict):
+        return False
+    target_rep = constraints.get("target_lab")
+    if not (isinstance(target_rep, list) and len(target_rep) == 3):
+        return False
+    for rep_v, want_v in zip(target_rep, req.target_lab):
+        if not _num_close(rep_v, want_v):
+            return False
+    if not _num_close(constraints.get("tolerance_de00"), req.tolerance_de):
+        return False
+    if constraints.get("max_shift_per_channel") != req.max_shift:
+        return False
+    if constraints.get("total_ink_limit") != req.tac_limit:
+        return False
+
+    if not isinstance(report.get("reachable"), bool):
+        return False
+    offset = report.get("best_offset_cmyk")
+    if not (isinstance(offset, list) and len(offset) == 4):
+        return False
+    if not all(isinstance(v, int) and not isinstance(v, bool)
+               and -req.max_shift <= v <= req.max_shift for v in offset):
+        return False
+
+    search = report.get("search")
+    if not isinstance(search, dict):
+        return False
+    feasible_count = search.get("feasible_offset_count")
+    if not isinstance(feasible_count, int) or feasible_count < 0:
+        return False
+    if feasible_count == 0 and offset != [0, 0, 0, 0]:
+        return False
+    abs_sum = report.get("best_abs_shift_sum")
+    if report["reachable"]:
+        # 可达必有最优偏移：可行数至少 1，绝对值和必须存在且自洽。
+        if feasible_count < 1:
+            return False
+        if not (isinstance(abs_sum, int) and not isinstance(abs_sum, bool)):
+            return False
+    if isinstance(abs_sum, int) and not isinstance(abs_sum, bool):
+        if abs_sum != sum(abs(v) for v in offset):
+            return False
+
+    artifacts = report.get("artifacts")
+    if not isinstance(artifacts, dict):
+        return False
+    if artifacts.get("before_png") != "before.png" or \
+            artifacts.get("after_png") != "after.png":
+        return False
+    if report["reachable"]:
+        if artifacts.get("tiff") != "retouched.tif":
+            return False
+    elif artifacts.get("tiff") is not None:
+        return False
+
+    residual = report.get("residual")
+    if not isinstance(residual, dict):
+        return False
+    mean_before = residual.get("mean_lab_before")
+    if not (isinstance(mean_before, list) and len(mean_before) == 3
+            and all(_is_num(v) for v in mean_before)):
+        return False
+    target_round = residual.get("target_lab")
+    if not (isinstance(target_round, list) and len(target_round) == 3):
+        return False
+    for rep_v, want_v in zip(target_round, req.target_lab):
+        if not _is_num(rep_v) or abs(float(rep_v) - float(want_v)) > 5e-4:
+            return False
+    de_before = residual.get("de00_before_to_target")
+    if not (_is_num(de_before) and float(de_before) >= -1e-6):
+        return False
+    if report["reachable"]:
+        mean_after = residual.get("mean_lab_after")
+        if not (isinstance(mean_after, list) and len(mean_after) == 3
+                and all(_is_num(v) for v in mean_after)):
+            return False
+        de_to = residual.get("de00_to_target")
+        if not (_is_num(de_to) and -1e-6 <= float(de_to)
+                <= float(req.tolerance_de) + 5e-4):
+            return False
+        for key in ("mean_de00_before_after", "max_de00_before_after"):
+            if not (_is_num(residual.get(key)) and float(residual[key]) >= -1e-6):
+                return False
+    else:
+        if residual.get("mean_lab_after") is not None:
+            return False
+        if residual.get("mean_de00_before_after") is not None or \
+                residual.get("max_de00_before_after") is not None:
+            return False
+        de_to = residual.get("de00_to_target")
+        if feasible_count > 0 and not _is_num(de_to):
+            return False
+    return True
+
+
+def _file_sha256(path: Path) -> str | None:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def _check_artifacts_on_disk(base: Path, report: dict, req: RetouchRequest,
+                             ctx: dict, press_bytes: bytes,
+                             display_bytes: bytes) -> bool:
+    """核对预览 PNG 与成品 TIFF 确实绑定本次任务、矩形与约束。"""
+    digests = report.get("artifact_sha256")
+    if not isinstance(digests, dict) or not digests:
+        # 旧版报告没有产物摘要：无法证明绑定关系，拒绝复用。
+        return False
+
+    before_path = base / "before.png"
+    after_path = base / "after.png"
+    if digests.get("before.png") != _file_sha256(before_path):
+        return False
+    if digests.get("after.png") != _file_sha256(after_path):
+        return False
+
+    region = report["region"]
+    rw, rh = region["width"], region["height"]
+    for path in (before_path, after_path):
+        try:
+            with Image.open(path) as im:
+                if im.format != "PNG" or im.mode != "RGB":
+                    return False
+                if im.size != (rw, rh):
+                    return False
+                if im.info.get("icc_profile") != display_bytes:
+                    return False
+        except (OSError, UnidentifiedImageError):
+            return False
+
+    if report["reachable"]:
+        tiff_path = base / "retouched.tif"
+        if digests.get("retouched.tif") != _file_sha256(tiff_path):
+            return False
+        try:
+            with Image.open(tiff_path) as im:
+                if im.format != "TIFF" or im.mode != "CMYK":
+                    return False
+                cmyk_full = ctx["cmyk"]
+                if im.size != (cmyk_full.shape[1], cmyk_full.shape[0]):
+                    return False
+                if im.info.get("icc_profile") != press_bytes:
+                    return False
+                # np.asarray 可能惰性持有文件句柄，全部像素检查都在
+                # 上下文打开期间完成。
+                arr = np.array(im)
+                x, y = region["x"], region["y"]
+                roi_after = arr[y:y + rh, x:x + rw]
+                offset = np.asarray(report["best_offset_cmyk"], dtype=np.int32)
+                roi_before = cmyk_full[y:y + rh, x:x + rw].astype(np.int32)
+                if not np.array_equal(
+                        roi_after.astype(np.int32) - roi_before,
+                        np.broadcast_to(offset, roi_after.shape)):
+                    return False
+                # 通道范围与总墨量必须在选区逐像素满足本次约束。
+                if int(roi_after.min()) < 0 or int(roi_after.max()) > 255:
+                    return False
+                if int(roi_after.sum(axis=2).max()) > req.tac_limit:
+                    return False
+                if int(np.abs(roi_after.astype(np.int32) - roi_before).max()) \
+                        > req.max_shift:
+                    return False
+                outside = np.ones(arr.shape[:2], dtype=bool)
+                outside[y:y + rh, x:x + rw] = False
+                if not np.array_equal(arr[outside], cmyk_full[outside]):
+                    return False
+        except (OSError, UnidentifiedImageError):
+            return False
+    elif (base / "retouched.tif").exists():
+        # 不可达却残留成品，绑定关系不成立。
+        return False
+    return True
+
+
+def cached_report_if_valid(base: Path, retouch_id: str, meta: dict,
+                           req: RetouchRequest, ctx: dict,
+                           press_summary: dict, display_summary: dict,
+                           press_bytes: bytes, display_bytes: bytes) -> dict | None:
+    """返回可安全复用的缓存报告；任何绑定不符/产物损坏均返回 ``None``。
+
+    调用方随后必须按本次请求重新计算。校验本身绝不抛异常：磁盘内容不可
+    信时一律按“缓存失效”处理。
+    """
+    try:
+        report_path = base / "report.json"
+        if not report_path.exists():
+            return None
+        report = json.loads(report_path.read_text("utf-8"))
+        if not _check_report_binding(report, retouch_id, meta, req, ctx,
+                                     press_summary, display_summary):
+            return None
+        if not _check_artifacts_on_disk(base, report, req, ctx,
+                                        press_bytes, display_bytes):
+            return None
+        return report
+    except (OSError, ValueError, TypeError, KeyError, IndexError):
+        return None
+
+
+def atomic_write_bytes(path: Path, data: bytes) -> None:
+    """同目录临时文件 + os.replace，避免崩溃/并发下出现半截产物。"""
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "wb") as fh:
+        fh.write(data)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    atomic_write_bytes(path, text.encode("utf-8"))

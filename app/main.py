@@ -1,6 +1,7 @@
 """FastAPI application: 印前色彩软打样台."""
 from __future__ import annotations
 
+import hashlib
 import json
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -371,10 +372,14 @@ def create_retouch(payload: dict | None = None):
 
     retouch_id = rt.compute_retouch_id(meta, req)
     base = _retouch_dir(retouch_id)
-    report_path = base / "report.json"
-    if report_path.exists():
-        report = json.loads(report_path.read_text("utf-8"))
-    else:
+    # 命中磁盘结果前，必须核对报告、预览 PNG 与成品 TIFF 与本次任务、矩形、
+    # 约束及 ICC 全部绑定；任一不符（含旧版无摘要报告、损坏/被替换文件）
+    # 一律拒绝复用，按本次请求重新计算。
+    report = rt.cached_report_if_valid(
+        base, retouch_id, meta, req, ctx,
+        press_summary_full, display_summary_full, press_bytes, display_bytes,
+    )
+    if report is None:
         try:
             result = rt.run_retouch(req, ctx, press_bytes)
         except rt.RetouchError as exc:
@@ -389,24 +394,36 @@ def create_retouch(payload: dict | None = None):
             )
         except RuntimeError as exc:
             raise HTTPException(422, f"软打样渲染失败: {exc}")
-        (base / "before.png").write_bytes(pngs["before.png"])
-        (base / "after.png").write_bytes(pngs["after.png"])
+        rt.atomic_write_bytes(base / "before.png", pngs["before.png"])
+        rt.atomic_write_bytes(base / "after.png", pngs["after.png"])
 
-        report = rt.build_report(
-            retouch_id, meta, press_summary_full, display_summary_full, req, result
-        )
+        tiff_blob = None
         if result["reachable"]:
-            tiff = rt.export_retouched_tiff(result["_cmyk_adjusted"], press_bytes)
-            (base / "retouched.tif").write_bytes(tiff)
+            tiff_blob = rt.export_retouched_tiff(
+                result["_cmyk_adjusted"], press_bytes
+            )
+            rt.atomic_write_bytes(base / "retouched.tif", tiff_blob)
         else:
             # 不可达：显式不生成成品（若历史脏文件存在则移除）。
             stale = base / "retouched.tif"
             if stale.exists():
                 stale.unlink()
 
-        report_path.write_text(
+        artifact_sha256 = {
+            "before.png": hashlib.sha256(pngs["before.png"]).hexdigest(),
+            "after.png": hashlib.sha256(pngs["after.png"]).hexdigest(),
+        }
+        if tiff_blob is not None:
+            artifact_sha256["retouched.tif"] = hashlib.sha256(tiff_blob).hexdigest()
+
+        report = rt.build_report(
+            retouch_id, meta, press_summary_full, display_summary_full,
+            req, result, artifact_sha256=artifact_sha256,
+        )
+        # 报告最后原子落盘：它是“产物齐备且有效”的唯一提交标记。
+        rt.atomic_write_text(
+            base / "report.json",
             json.dumps(report, sort_keys=True, ensure_ascii=False, indent=2),
-            "utf-8",
         )
 
     return {
@@ -449,15 +466,27 @@ def get_retouch_report(retouch_id: str):
 @app.get("/api/retouch/{retouch_id}/{name}")
 def get_retouch_artifact(retouch_id: str, name: str):
     base = _require_retouch(retouch_id)
+    report = json.loads((base / "report.json").read_text("utf-8"))
+    digests = report.get("artifact_sha256")
     if name in ("before.png", "after.png"):
-        return FileResponse(base / name, media_type="image/png")
+        path = base / name
+        if not path.exists():
+            raise HTTPException(404, "产物不存在或已损坏，请重新提交修色请求")
+        if isinstance(digests, dict) and digests.get(name):
+            if hashlib.sha256(path.read_bytes()).hexdigest() != digests[name]:
+                raise HTTPException(422, "产物与修色报告绑定不符，已拒绝下载")
+        return FileResponse(path, media_type="image/png")
     if name == "retouched.tif":
-        report = json.loads((base / "report.json").read_text("utf-8"))
         if not report.get("reachable") or not (base / "retouched.tif").exists():
             # 不可达不产出成品。
             raise HTTPException(422, "无可行解或未达容差：标记为不可达，未生成成品 TIFF")
+        path = base / "retouched.tif"
+        if isinstance(digests, dict) and digests.get("retouched.tif"):
+            if hashlib.sha256(path.read_bytes()).hexdigest() \
+                    != digests["retouched.tif"]:
+                raise HTTPException(422, "成品与修色报告绑定不符，已拒绝下载")
         return FileResponse(
-            base / "retouched.tif", media_type="image/tiff",
+            path, media_type="image/tiff",
             filename=f"retouched-{retouch_id[:12]}.tif",
         )
     raise HTTPException(404, "产物不存在")
