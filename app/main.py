@@ -370,11 +370,22 @@ def create_retouch(payload: dict | None = None):
         )
 
     retouch_id = rt.compute_retouch_id(meta, req)
+    fingerprint = rt.request_fingerprint(meta, req)
     base = _retouch_dir(retouch_id)
     report_path = base / "report.json"
+    report = None
     if report_path.exists():
-        report = json.loads(report_path.read_text("utf-8"))
-    else:
+        try:
+            cached = json.loads(report_path.read_text("utf-8"))
+        except (json.JSONDecodeError, OSError):
+            cached = None
+        # 命中缓存必须核对报告、预览与成品同本次任务、矩形及约束的绑定；
+        # 不符（或报告不可读）时拒绝复用，落入下方按本次请求重新计算。
+        if cached is not None and rt.cache_entry_valid(
+            cached, retouch_id, fingerprint, base
+        ):
+            report = cached
+    if report is None:
         try:
             result = rt.run_retouch(req, ctx, press_bytes)
         except rt.RetouchError as exc:

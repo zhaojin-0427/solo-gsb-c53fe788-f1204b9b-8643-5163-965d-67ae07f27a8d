@@ -381,18 +381,80 @@ def export_retouched_tiff(cmyk_adjusted: np.ndarray, press_bytes: bytes) -> byte
     return buf.getvalue()
 
 
+def _canon_float(v: float) -> float:
+    """规范化浮点取值：-0.0 归一为 0.0，使数值相等的请求得到同一身份。"""
+    v = float(v)
+    return 0.0 if v == 0.0 else v
+
+
+def request_fingerprint(meta: dict, req: RetouchRequest) -> dict:
+    """完整修色请求的规范化指纹——修色结果身份与缓存核对的唯一依据。
+
+    身份规则：一次修色由 **原任务（job_id 及其固化的渲染意图）+ 选区矩形
+    + 目标 Lab + 容差 + 单通道偏移上限 + 总墨量上限** 的完整组合唯一确定。
+    指纹为带字段名的字典，经 :func:`_canonical_json` 序列化后不存在字段间
+    无分隔拼接的歧义（如 (x=1, y=23) 与 (x=12, y=3) 都拼出 "123"）；
+    浮点按最短往返表示完整保留双精度取值，不做 ``%.6f`` 之类的截断，
+    目标 Lab / 容差在任意小数位上的差异都会得到不同身份。
+    """
+    return {
+        "job_id": meta["job_id"],
+        "source_intent": meta.get("source_intent", ""),
+        "proof_intent": meta.get("proof_intent", ""),
+        "x": int(req.x),
+        "y": int(req.y),
+        "width": int(req.width),
+        "height": int(req.height),
+        "target_lab": [_canon_float(v) for v in req.target_lab],
+        "tolerance_de": _canon_float(req.tolerance_de),
+        "max_shift": int(req.max_shift),
+        "tac_limit": int(req.tac_limit),
+    }
+
+
+def _canonical_json(obj) -> str:
+    """逐字节确定的 JSON：键排序、紧凑分隔符；float 走最短往返表示（repr），
+    完整保留双精度精度且 JSON 解析回原值（缓存核对可直接做字典相等比较）。"""
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False)
+
+
 def compute_retouch_id(meta: dict, req: RetouchRequest) -> str:
-    h = hashlib.sha256()
-    h.update(meta["job_id"].encode())
-    h.update(meta.get("source_intent", "").encode())
-    h.update(meta.get("proof_intent", "").encode())
-    for key in ("x", "y", "width", "height"):
-        h.update(str(getattr(req, key)).encode())
-    h.update(",".join(f"{v:.6f}" for v in req.target_lab).encode())
-    h.update(f"{req.tolerance_de:.6f}".encode())
-    h.update(str(req.max_shift).encode())
-    h.update(str(req.tac_limit).encode())
-    return h.hexdigest()
+    """retouch_id = 完整请求指纹的规范 JSON 之 SHA-256。"""
+    return hashlib.sha256(
+        _canonical_json(request_fingerprint(meta, req)).encode("utf-8")
+    ).hexdigest()
+
+
+def cache_entry_valid(report: object, retouch_id: str, fingerprint: dict,
+                      base: Path) -> bool:
+    """命中缓存时核对报告与产物确实绑定本次任务、矩形及约束。
+
+    任一不符即拒绝复用（调用方按本次请求重新计算并覆盖）：
+
+    * 报告须记录同一 ``retouch_id`` 与**完全一致的请求指纹**（任务、选区
+      矩形、目标 Lab、容差、偏移/总墨量约束逐项相等）；
+    * 报告须绑定同一原任务；
+    * 修色前/后预览 PNG 必须都在；
+    * 可达时成品 TIFF 必须在；不可达时不得残留成品 TIFF。
+    """
+    if not isinstance(report, dict):
+        return False
+    if report.get("retouch_id") != retouch_id:
+        return False
+    if report.get("request") != fingerprint:
+        return False
+    source_job = report.get("source_job")
+    if not isinstance(source_job, dict) or \
+            source_job.get("job_id") != fingerprint["job_id"]:
+        return False
+    if not (base / "before.png").is_file() or \
+            not (base / "after.png").is_file():
+        return False
+    tiff = base / "retouched.tif"
+    if report.get("reachable") is True:
+        return tiff.is_file()
+    return not tiff.exists()
 
 
 def build_report(retouch_id: str, meta: dict, press_summary: dict,
@@ -400,6 +462,8 @@ def build_report(retouch_id: str, meta: dict, press_summary: dict,
     """修色报告：记录原任务、ICC 摘要、全部约束与最终偏移。"""
     return {
         "retouch_id": retouch_id,
+        # 完整请求指纹：缓存命中时据此核对报告与本次任务/矩形/约束的绑定。
+        "request": request_fingerprint(meta, req),
         "source_job": {
             "job_id": meta["job_id"],
             "image_sha256": meta.get("image_sha256"),
