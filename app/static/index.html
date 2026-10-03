@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>印前色彩软打样台</title>
+<link rel="stylesheet" href="/styles.css">
+<link rel="stylesheet" href="/release.css">
+</head>
+<body>
+<header>
+  <h1>印前色彩软打样台</h1>
+  <div class="subtitle">LittleCMS 色彩管理 · CIEDE2000 像素级色差 · 源→印刷→显示全链路软打样</div>
+  <nav class="topnav">
+    <button class="navbtn active" data-view="softproof">软打样</button>
+    <button class="navbtn" data-view="retouch">局部 CMYK 修色</button>
+    <button class="navbtn" data-view="release">印刷配置版本发布与回归门禁</button>
+  </nav>
+</header>
+
+<!-- ===================== 视图一：软打样（原有） ===================== -->
+<main id="view-softproof" class="view">
+  <section class="panel controls">
+    <h2>1. 上传图像</h2>
+    <div class="row">
+      <input type="file" id="imageFile" accept=".tif,.tiff,.png,.jpg,.jpeg">
+      <span id="imageInfo" class="hint"></span>
+    </div>
+    <div class="row">
+      <label class="inline"><input type="checkbox" id="useEmbedded"> 使用图像内嵌 ICC 作为源配置</label>
+    </div>
+
+    <h2>2. ICC 配置</h2>
+    <div class="formgrid">
+      <label>源配置 (RGB/CMYK/灰度)
+        <select id="sourceProfile"></select>
+      </label>
+      <label>印刷配置 (CMYK)
+        <select id="pressProfile"></select>
+      </label>
+      <label>显示配置 (RGB)
+        <select id="displayProfile"></select>
+      </label>
+    </div>
+
+    <details class="upload-profiles">
+      <summary>上传自定义 ICC 配置（.icc/.icm）</summary>
+      <div class="row">
+        <select id="uploadRole">
+          <option value="source">源配置</option>
+          <option value="press" selected>印刷配置</option>
+          <option value="display">显示配置</option>
+        </select>
+        <input type="file" id="profileFile" accept=".icc,.icm">
+        <button type="button" id="uploadProfileBtn">上传</button>
+      </div>
+      <div id="profileUploadMsg" class="hint"></div>
+    </details>
+
+    <h2>3. 渲染意图与阈值</h2>
+    <div class="formgrid">
+      <label>源 → 印刷 渲染意图
+        <select id="sourceIntent">
+          <option value="perceptual">感知 (Perceptual)</option>
+          <option value="relative_colorimetric" selected>相对色度 (Relative Colorimetric)</option>
+          <option value="saturation">饱和度 (Saturation)</option>
+          <option value="absolute_colorimetric">绝对色度 (Absolute Colorimetric)</option>
+        </select>
+      </label>
+      <label>Lab → 显示 渲染意图
+        <select id="proofIntent">
+          <option value="perceptual">感知 (Perceptual)</option>
+          <option value="relative_colorimetric" selected>相对色度 (Relative Colorimetric)</option>
+          <option value="saturation">饱和度 (Saturation)</option>
+          <option value="absolute_colorimetric">绝对色度 (Absolute Colorimetric)</option>
+        </select>
+      </label>
+      <label>色差阈值 ΔE00
+        <input type="number" id="threshold" value="3.0" min="0" step="0.1">
+      </label>
+    </div>
+
+    <div class="row">
+      <button type="button" id="runBtn" class="primary">生成软打样</button>
+      <span id="busy" class="hint" hidden>处理中…</span>
+    </div>
+    <div id="errorBox" class="error" hidden></div>
+  </section>
+
+  <section class="panel results" id="resultsPanel" hidden>
+    <div class="tabs">
+      <button class="tab active" data-view="preview">源图显示预览</button>
+      <button class="tab" data-view="softproof">软打样</button>
+      <button class="tab" data-view="heatmap">ΔE 热图</button>
+      <button class="tab" data-view="overlay">热图叠加</button>
+      <button class="tab" data-view="mask">超阈值遮罩</button>
+    </div>
+
+    <div class="canvas-wrap" id="canvasWrap">
+      <img id="viewImage" alt="预览">
+      <canvas id="roiCanvas"></canvas>
+    </div>
+    <div class="hint">在图像上按住鼠标拖拽框选区域，查看该区域各阶段 Lab / CMYK 值。</div>
+
+    <div class="stats" id="statsBar"></div>
+
+    <div id="regionPanel" class="region" hidden>
+      <h3>框选区域分析</h3>
+      <pre id="regionData"></pre>
+    </div>
+
+    <div class="exports">
+      <h3>导出（绑定原图哈希、配置摘要与参数）</h3>
+      <a id="expPreview" class="btn" download>预览 PNG</a>
+      <a id="expProof" class="btn" download>软打样 PNG</a>
+      <a id="expHeat" class="btn" download>热图 PNG</a>
+      <a id="expMask" class="btn" download>遮罩 PNG</a>
+      <a id="expReport" class="btn" download>JSON 报告</a>
+      <a id="expZip" class="btn primary">打包下载 ZIP</a>
+    </div>
+
+    <details class="reportbox">
+      <summary>查看 JSON 报告</summary>
+      <pre id="reportJson"></pre>
+    </details>
+  </section>
+</main>
+
+<!-- ================= 视图二：局部 CMYK 修色 ================= -->
+<main id="view-retouch" class="view" hidden>
+  <section class="panel controls">
+    <h2>1. 选择已保存任务</h2>
+    <div class="row">
+      <select id="rtJobSelect"></select>
+      <button type="button" id="rtRefreshJobs" class="btn">刷新任务列表</button>
+    </div>
+    <div id="rtJobMeta" class="hint"></div>
+
+    <h2>2. 框选修色选区（≤ 64×64 像素）</h2>
+    <div class="canvas-wrap" id="rtCanvasWrap">
+      <img id="rtViewImage" alt="已保存任务软打样">
+      <canvas id="rtRoiCanvas"></canvas>
+    </div>
+    <div class="hint">在软打样图上拖拽框选矩形；选区任一边不得超过 64 像素。</div>
+    <div class="row">
+      <label>x <input type="number" id="rtX" min="0" value="0"></label>
+      <label>y <input type="number" id="rtY" min="0" value="0"></label>
+      <label>宽 <input type="number" id="rtW" min="1" max="64" value="16"></label>
+      <label>高 <input type="number" id="rtH" min="1" max="64" value="16"></label>
+    </div>
+
+    <h2>3. 修色目标与约束</h2>
+    <div class="formgrid">
+      <label>目标 L*（0–100）
+        <input type="number" id="rtLabL" min="0" max="100" step="0.01" value="50">
+      </label>
+      <label>目标 a*（-128–127）
+        <input type="number" id="rtLabA" min="-128" max="127" step="0.01" value="0">
+      </label>
+      <label>目标 b*（-128–127）
+        <input type="number" id="rtLabB" min="-128" max="127" step="0.01" value="0">
+      </label>
+      <label>ΔE00 容差（≥ 0）
+        <input type="number" id="rtTol" min="0" step="0.1" value="3">
+      </label>
+      <label>单通道偏移绝对值上限（0–8 整数）
+        <input type="number" id="rtMaxShift" min="0" max="8" step="1" value="4">
+      </label>
+      <label>总墨量上限 C+M+Y+K（0–1020）
+        <input type="number" id="rtTac" min="0" max="1020" step="1" value="900">
+      </label>
+    </div>
+
+    <div class="row">
+      <button type="button" id="rtRunBtn" class="primary">搜索统一 CMYK 偏移</button>
+      <span id="rtBusy" class="hint" hidden>搜索中…</span>
+    </div>
+    <div id="rtError" class="error" hidden></div>
+  </section>
+
+  <section class="panel" id="rtResultPanel" hidden>
+    <h2>修色结果</h2>
+    <div id="rtStatus" class="rt-status"></div>
+    <div class="stats" id="rtStats"></div>
+    <div class="rt-proofs">
+      <figure>
+        <figcaption>修色前软打样（选区）</figcaption>
+        <img id="rtBeforeImg" alt="修色前">
+      </figure>
+      <figure>
+        <figcaption>修色后软打样（选区）</figcaption>
+        <img id="rtAfterImg" alt="修色后">
+      </figure>
+    </div>
+    <div id="rtResidual" class="region"></div>
+    <div class="exports">
+      <a id="rtExpTiff" class="btn primary" hidden download>下载修色 CMYK TIFF（嵌入印刷 ICC）</a>
+      <a id="rtExpReport" class="btn" download>下载修色报告 JSON</a>
+    </div>
+    <details class="reportbox">
+      <summary>查看修色报告</summary>
+      <pre id="rtReportJson"></pre>
+    </details>
+  </section>
+</main>
+
+<!-- ================= 视图三：发布与回归门禁（新增） ================= -->
+<main id="view-release" class="view" hidden>
+  <section class="panel" id="relLeft">
+    <div class="rel-head">
+      <h2>印刷配置族</h2>
+      <button type="button" id="relRefresh" class="btn">刷新</button>
+    </div>
+    <div class="row">
+      <input type="text" id="newFamilyName" placeholder="新配置族名称，如 GRACoL2013-CRPC6">
+      <button type="button" id="createFamilyBtn" class="primary">新建配置族</button>
+    </div>
+    <div id="familyList" class="family-list"></div>
+    <div id="relError" class="error" hidden></div>
+
+    <details class="auditbox">
+      <summary>不可变审计日志（当前族）</summary>
+      <div id="auditList" class="audit-list"></div>
+    </details>
+  </section>
+
+  <section class="panel" id="relRight">
+    <div id="relWelcome" class="hint">
+      请在左侧选择或新建一个印刷配置族。典型流程：<br>
+      1）在“软打样”页跑一个代表性任务并保存为门禁基线；<br>
+      2）为配置族上传候选印刷 ICC 草稿（按 SHA-256 固定快照）；<br>
+      3）运行回归门禁，逐项查看 ΔE 均值 / P95 / 超阈面积比例 / 遮罩变化像素；<br>
+      4）全部通过后用期望版本号发布；失败则保留草稿；<br>
+      5）随时撤回当前版本或恢复（回滚）到任一历史版本。
+    </div>
+    <div id="relDetail" hidden></div>
+  </section>
+</main>
+
+<footer>
+  所有色彩转换均经 LittleCMS 完成；预览/软打样 PNG 嵌入所选显示配置，热图/遮罩嵌入 sRGB，浏览器不会按未标记数据自行解释。
+</footer>
+
+<script src="/app.js"></script>
+<script src="/retouch.js"></script>
+<script src="/release.js"></script>
+</body>
+</html>

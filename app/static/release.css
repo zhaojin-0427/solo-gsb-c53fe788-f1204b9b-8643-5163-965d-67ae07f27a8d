@@ -1,0 +1,162 @@
+/* 印刷配置版本发布与回归门禁 模块样式 */
+.topnav {
+  margin-top: 12px;
+  display: flex;
+  gap: 8px;
+}
+.navbtn {
+  background: rgba(255, 255, 255, 0.08);
+  color: #dce6f2;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  padding: 6px 16px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.navbtn.active {
+  background: #3a6ea5;
+  color: #fff;
+  border-color: #3a6ea5;
+  font-weight: 600;
+}
+#view-release {
+  grid-template-columns: 340px 1fr;
+}
+.rel-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.rel-head h2 { margin: 0; }
+.family-list { margin-top: 10px; display: flex; flex-direction: column; gap: 6px; }
+.family-item {
+  border: 1px solid #e2e5ea;
+  border-radius: 8px;
+  padding: 10px 12px;
+  cursor: pointer;
+  background: #fafbfd;
+}
+.family-item:hover { border-color: #3a6ea5; }
+.family-item.active {
+  border-color: #3a6ea5;
+  background: #e8f0f8;
+  box-shadow: inset 0 0 0 1px #3a6ea5;
+}
+.family-item .fname { font-weight: 600; font-size: 14px; }
+.family-item .fmeta { font-size: 12px; color: #7a828f; margin-top: 3px; }
+.pill {
+  display: inline-block;
+  font-size: 11px;
+  border-radius: 10px;
+  padding: 1px 9px;
+  margin-left: 6px;
+  vertical-align: middle;
+}
+.pill.current { background: #1f8a4d; color: #fff; }
+.pill.draft { background: #b07a1e; color: #fff; }
+.pill.superseded { background: #9aa3b0; color: #fff; }
+.pill.withdrawn { background: #a02525; color: #fff; }
+.pill.passed { background: #1f8a4d; color: #fff; }
+.pill.failed { background: #a02525; color: #fff; }
+
+.rel-section {
+  border: 1px solid #e2e5ea;
+  border-radius: 8px;
+  padding: 12px 14px;
+  margin: 12px 0;
+  background: #fafbfd;
+}
+.rel-section h3 { margin-top: 0; }
+.rel-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.kv { font-size: 13px; line-height: 1.7; }
+.kv code { font-size: 12px; color: #1d4f7a; }
+table.rel-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+  margin-top: 6px;
+}
+table.rel-table th, table.rel-table td {
+  border: 1px solid #e2e5ea;
+  padding: 5px 8px;
+  text-align: left;
+  vertical-align: top;
+}
+table.rel-table th { background: #f0f3f8; }
+tr.check-fail td { background: #fdecec; }
+tr.check-pass td { background: #ecf8f0; }
+.gate-thumbs { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 8px; }
+.gate-thumbs figure { margin: 0; text-align: center; }
+.gate-thumbs img {
+  max-width: 220px;
+  max-height: 220px;
+  border: 1px solid #c7ccd6;
+  border-radius: 6px;
+  background:
+    repeating-conic-gradient(#eee 0% 25%, #fafafa 0% 50%) 0 0/16px 16px;
+}
+.gate-thumbs figcaption { font-size: 12px; color: #555; margin-top: 3px; }
+.audit-list { max-height: 320px; overflow: auto; font-size: 12px; }
+.audit-item {
+  border-bottom: 1px dashed #dde1e8;
+  padding: 6px 2px;
+}
+.audit-item .a-top { font-weight: 600; }
+.audit-item .a-hash { color: #7a828f; font-size: 11px; word-break: break-all; }
+.audit-item pre {
+  margin: 4px 0 0; font-size: 11px; white-space: pre-wrap;
+  background: #f4f5f7; padding: 6px; border-radius: 4px;
+}
+input[type=text] {
+  padding: 6px 8px;
+  border: 1px solid #c7ccd6;
+  border-radius: 6px;
+  font-size: 13px;
+  background: #fff;
+  flex: 1;
+}
+label.inline { flex-direction: row; align-items: center; gap: 6px; }
+.mono { font-family: ui-monospace, Menlo, Consolas, monospace; }
+.small { font-size: 12px; color: #7a828f; }
+
+/* 局部 CMYK 修色视图 */
+#view-retouch {
+  grid-template-columns: 420px 1fr;
+}
+.rt-status {
+  border-radius: 8px;
+  padding: 10px 14px;
+  font-size: 14px;
+  margin: 10px 0;
+}
+.rt-status.reachable {
+  background: #ecf8f0;
+  border: 1px solid #9ad4b0;
+  color: #1f6b3d;
+}
+.rt-status.unreachable {
+  background: #fdecec;
+  border: 1px solid #e0a4a4;
+  color: #a02525;
+}
+.rt-proofs {
+  display: flex;
+  gap: 18px;
+  flex-wrap: wrap;
+  margin: 12px 0;
+}
+.rt-proofs figure {
+  margin: 0;
+  text-align: center;
+}
+.rt-proofs img {
+  max-width: 320px;
+  max-height: 320px;
+  border: 1px solid #c7ccd6;
+  border-radius: 6px;
+  image-rendering: pixelated;
+  background:
+    repeating-conic-gradient(#eee 0% 25%, #fafafa 0% 50%) 0 0/16px 16px;
+}
+.rt-proofs figcaption { font-size: 12px; color: #555; margin-bottom: 4px; }
+#rtCanvasWrap { min-height: 240px; }
